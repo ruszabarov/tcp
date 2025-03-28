@@ -2,6 +2,7 @@ import os
 import random
 import string
 from transport import TransportSocket, ReadMode
+import time
 
 def generate_random_data(size):
     return ''.join(random.choices(string.ascii_letters + string.digits, k=size)).encode()
