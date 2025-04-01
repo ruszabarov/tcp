@@ -70,6 +70,15 @@ class TransportSocket:
         self.connection_established = threading.Event()
         self.connection_closed = threading.Event()
         self.last_window_probe_time = 0
+        
+        # RTT estimation variables
+        self.alpha = 0.875  # Common value used in TCP implementations
+        self.beta = 0.75    # For RTT deviation (variance)
+        self.estimated_rtt = None     # Smoothed RTT estimate
+        self.dev_rtt = None           # RTT deviation
+        self.current_timeout = DEFAULT_TIMEOUT  # Initial timeout
+        self.rtt_lock = threading.Lock()  # For thread-safe access to RTT values
+        self.send_times = {}          # Dictionary to store send times for packets
 
     def socket(self, sock_type, port, server_ip=None):
         self.sock_fd = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -104,6 +113,9 @@ class TransportSocket:
             
         syn_packet = Packet(seq=self.window["next_seq_to_send"], ack=0, flags=SYN_FLAG, adv_window=MAX_NETWORK_BUFFER)
         print(f"[{state_to_string(self.state)}] Sending SYN packet (seq={syn_packet.seq}, ack={syn_packet.ack}, flags={format_flags(syn_packet.flags)}, adv_window={syn_packet.adv_window})")
+        
+        # Record send time for SYN packet
+        self.send_times[syn_packet.seq] = time.time()
         self.sock_fd.sendto(syn_packet.encode(), self.conn)
         
         self.window["next_seq_to_send"] += 1
@@ -113,7 +125,8 @@ class TransportSocket:
         self.state = TCPState.SYN_SENT
         print(f"[{state_to_string(old_state)} -> {state_to_string(self.state)}] Waiting for SYN+ACK")
         
-        if not self.connection_established.wait(timeout=DEFAULT_TIMEOUT):
+        # Use dynamic timeout instead of fixed timeout
+        if not self.connection_established.wait(timeout=self.current_timeout):
             print(f"[{state_to_string(self.state)}] Connection timeout")
             self.state = TCPState.CLOSED
             print(f"[{state_to_string(self.state)} -> CLOSED] Connection failed")
@@ -138,11 +151,16 @@ class TransportSocket:
         fin_packet = Packet(seq=self.window["next_seq_to_send"], ack=self.window["last_ack"], 
                            flags=FIN_FLAG, adv_window=avail_window)
         print(f"[{state_to_string(self.state)}] Sending FIN packet (seq={fin_packet.seq}, ack={fin_packet.ack}, flags={format_flags(fin_packet.flags)}, adv_window={avail_window})")
+        
+        # Record send time for FIN packet
+        self.send_times[fin_packet.seq] = time.time()
         self.sock_fd.sendto(fin_packet.encode(), self.conn)
+        
         self.window["next_seq_to_send"] += 1
         self.window["last_byte_sent"] = self.window["next_seq_to_send"]
         
-        if not self.connection_closed.wait(timeout=DEFAULT_TIMEOUT):
+        # Use dynamic timeout
+        if not self.connection_closed.wait(timeout=self.current_timeout):
             print(f"[{state_to_string(self.state)}] Close operation timed out")
         
         self.death_lock.acquire()
@@ -303,6 +321,9 @@ class TransportSocket:
                 # Update last_byte_sent
                 self.window["last_byte_sent"] = seq_no + payload_len
                 
+            # Record send time for RTT calculation
+            self.send_times[seq_no] = time.time()
+                
             # Send packet outside the lock
             print(f"[{state_to_string(self.state)}] Sending data segment (seq={segment.seq}, ack={segment.ack}, flags={format_flags(segment.flags)}, len={payload_len}, effective_window={effective_window})")
             self.sock_fd.sendto(segment.encode(), self.conn)
@@ -332,8 +353,35 @@ class TransportSocket:
                 payload=b"?",  # 1-byte probe
             )
             
+        # Record send time for RTT calculation
+        self.send_times[seq_no] = time.time()
+        
         print(f"[{state_to_string(self.state)}] Sending window probe (seq={seq_no})")
         self.sock_fd.sendto(probe.encode(), self.conn)
+
+    def update_rtt_estimate(self, sample_rtt):
+        """Update RTT estimates using EWMA and calculate new timeout"""
+        with self.rtt_lock:
+            if self.estimated_rtt is None:
+                # First RTT measurement
+                self.estimated_rtt = sample_rtt
+                self.dev_rtt = sample_rtt / 2  # Initial deviation estimate
+            else:
+                # Update RTT estimate using EWMA
+                self.estimated_rtt = self.alpha * self.estimated_rtt + (1 - self.alpha) * sample_rtt
+                
+                # Update RTT deviation
+                rtt_diff = abs(sample_rtt - self.estimated_rtt)
+                self.dev_rtt = self.beta * self.dev_rtt + (1 - self.beta) * rtt_diff
+            
+            # Calculate timeout value (common formula: EstimatedRTT + 4 * DevRTT)
+            self.current_timeout = self.estimated_rtt + 4 * self.dev_rtt
+            
+            # Set bounds on timeout value (min: 1 second, max: 60 seconds)
+            self.current_timeout = min(max(1.0, self.current_timeout), 60.0)
+            
+            print(f"[RTT] Sample RTT: {sample_rtt:.3f}s, Estimated RTT: {self.estimated_rtt:.3f}s, "
+                  f"Deviation: {self.dev_rtt:.3f}s, New timeout: {self.current_timeout:.3f}s")
 
     def wait_for_ack(self, ack_goal):
         with self.recv_lock:
@@ -341,7 +389,7 @@ class TransportSocket:
             print(f"[{state_to_string(self.state)}] Waiting for ACK (current={self.window['next_seq_expected']}, goal={ack_goal})")
             while self.window["next_seq_expected"] < ack_goal:
                 elapsed = time.time() - start
-                remaining = DEFAULT_TIMEOUT - elapsed
+                remaining = self.current_timeout - elapsed  # Use dynamic timeout
                 if remaining <= 0:
                     print(f"[{state_to_string(self.state)}] ACK timeout (current={self.window['next_seq_expected']}, goal={ack_goal})")
                     return False
@@ -384,6 +432,9 @@ class TransportSocket:
                         adv_window=avail_window
                     )
                     print(f"[{state_to_string(self.state)}] Sending SYN+ACK packet (seq={synack_packet.seq}, ack={synack_packet.ack}, flags={format_flags(synack_packet.flags)}, adv_window={avail_window})")
+                    
+                    # Record send time for SYN+ACK
+                    self.send_times[synack_packet.seq] = time.time()
                     self.sock_fd.sendto(synack_packet.encode(), addr)
 
                     self.window["next_seq_to_send"] += 1
@@ -400,6 +451,12 @@ class TransportSocket:
                             self.window["next_seq_expected"] = packet.ack
                             self.window["last_byte_acked"] = packet.ack
                             self.window["send_window"] = packet.adv_window
+                            
+                            # Calculate RTT for SYN
+                            if packet.ack - 1 in self.send_times:
+                                sample_rtt = time.time() - self.send_times[packet.ack - 1]
+                                del self.send_times[packet.ack - 1]  # Clean up dictionary
+                                self.update_rtt_estimate(sample_rtt)
                             
                             avail_window = MAX_NETWORK_BUFFER - self.window["recv_len"]
                             ack_packet = Packet(
@@ -428,6 +485,9 @@ class TransportSocket:
                             adv_window=avail_window
                         )
                         print(f"[{state_to_string(self.state)}] Simultaneous open: Sending SYN+ACK (seq={synack_packet.seq}, ack={synack_packet.ack}, flags={format_flags(synack_packet.flags)}, adv_window={avail_window})")
+                        
+                        # Record send time for SYN+ACK
+                        self.send_times[synack_packet.seq] = time.time()
                         self.sock_fd.sendto(synack_packet.encode(), addr)
                         
                         self.window["last_ack"] = packet.seq + 1
@@ -442,6 +502,12 @@ class TransportSocket:
                             self.window["next_seq_expected"] = packet.ack
                             self.window["last_byte_acked"] = packet.ack
                             print(f"[{state_to_string(self.state)}] Updated next_seq_expected to {packet.ack}")
+                            
+                            # Calculate RTT for SYN+ACK
+                            if packet.ack - 1 in self.send_times:
+                                sample_rtt = time.time() - self.send_times[packet.ack - 1]
+                                del self.send_times[packet.ack - 1]  # Clean up dictionary
+                                self.update_rtt_estimate(sample_rtt)
                     
                     old_state = self.state
                     self.state = TCPState.ESTABLISHED
@@ -490,6 +556,12 @@ class TransportSocket:
                                 self.window["next_seq_expected"] = packet.ack
                                 self.window["last_byte_acked"] = packet.ack
                                 print(f"[{state_to_string(self.state)}] Updated next_seq_expected to {packet.ack}")
+                                
+                                # Calculate RTT for FIN
+                                if packet.ack - 1 in self.send_times:
+                                    sample_rtt = time.time() - self.send_times[packet.ack - 1]
+                                    del self.send_times[packet.ack - 1]  # Clean up dictionary
+                                    self.update_rtt_estimate(sample_rtt)
                         print(f"[{state_to_string(self.state)}] Received ACK for our FIN, waiting for peer's FIN")
 
                 elif self.state == TCPState.LAST_ACK and (packet.flags & ACK_FLAG) != 0:
@@ -498,6 +570,12 @@ class TransportSocket:
                             self.window["next_seq_expected"] = packet.ack
                             self.window["last_byte_acked"] = packet.ack
                             print(f"[{state_to_string(self.state)}] Updated next_seq_expected to {packet.ack}")
+                            
+                            # Calculate RTT for FIN in LAST_ACK state
+                            if packet.ack - 1 in self.send_times:
+                                sample_rtt = time.time() - self.send_times[packet.ack - 1]
+                                del self.send_times[packet.ack - 1]  # Clean up dictionary
+                                self.update_rtt_estimate(sample_rtt)
                     
                     old_state = self.state
                     self.state = TCPState.CLOSED
@@ -507,9 +585,25 @@ class TransportSocket:
                 elif (packet.flags & ACK_FLAG) != 0 and not (packet.flags & SYN_FLAG) and not (packet.flags & FIN_FLAG):
                     with self.recv_lock:
                         if packet.ack > self.window["next_seq_expected"]:
+                            old_seq_expected = self.window["next_seq_expected"]
                             self.window["next_seq_expected"] = packet.ack
                             self.window["last_byte_acked"] = packet.ack
                             print(f"[{state_to_string(self.state)}] Updated next_seq_expected to {packet.ack}")
+                            
+                            # Calculate RTT for data segment
+                            # Find the most recent sequence number that this ACK covers
+                            for seq in sorted([s for s in self.send_times.keys() if s < packet.ack], reverse=True):
+                                if seq >= old_seq_expected:
+                                    sample_rtt = time.time() - self.send_times[seq]
+                                    del self.send_times[seq]  # Clean up dictionary
+                                    self.update_rtt_estimate(sample_rtt)
+                                    break
+                            
+                            # Clean up old entries from send_times dictionary
+                            for seq in list(self.send_times.keys()):
+                                if seq < packet.ack:
+                                    del self.send_times[seq]
+                        
                         self.wait_cond.notify_all()
 
                 if len(packet.payload) > 0 and self.state in [TCPState.ESTABLISHED, TCPState.CLOSE_WAIT]:
@@ -563,7 +657,7 @@ class TransportSocket:
                         continue
 
                 if self.state == TCPState.TIME_WAIT:
-                    if time.time() - self.time_wait_start >= 2 * DEFAULT_TIMEOUT:  # 2 segment lifetimes
+                    if time.time() - self.time_wait_start >= 2 * self.current_timeout:  # Use dynamic timeout
                         old_state = self.state
                         self.state = TCPState.CLOSED
                         print(f"[{state_to_string(old_state)} -> {state_to_string(self.state)}] TIME_WAIT completed")
