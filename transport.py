@@ -57,7 +57,9 @@ class TransportSocket:
             "recv_buf": b"",          # Received data buffer
             "recv_len": 0,            # How many bytes are in recv_buf
             "next_seq_to_send": 0,    # The sequence number for the next packet we send
-            "send_window": 0,         # Current send window size (based on receiver's advertised window)
+            "send_window": MAX_NETWORK_BUFFER,  # Current send window size (based on receiver's advertised window)
+            "last_byte_sent": 0,      # Last byte sent (for calculating effective window)
+            "last_byte_acked": 0      # Last byte acknowledged (for calculating effective window)
         }
         self.sock_type = None
         self.conn = None
@@ -67,6 +69,7 @@ class TransportSocket:
         self.time_wait_start = None
         self.connection_established = threading.Event()
         self.connection_closed = threading.Event()
+        self.last_window_probe_time = 0
 
     def socket(self, sock_type, port, server_ip=None):
         self.sock_fd = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -99,11 +102,12 @@ class TransportSocket:
             print(f"[{state_to_string(self.state)}] Cannot connect: invalid state or socket type")
             return EXIT_ERROR
             
-        syn_packet = Packet(seq=self.window["next_seq_to_send"], ack=0, flags=SYN_FLAG)
-        print(f"[{state_to_string(self.state)}] Sending SYN packet (seq={syn_packet.seq}, ack={syn_packet.ack}, flags={format_flags(syn_packet.flags)})")
+        syn_packet = Packet(seq=self.window["next_seq_to_send"], ack=0, flags=SYN_FLAG, adv_window=MAX_NETWORK_BUFFER)
+        print(f"[{state_to_string(self.state)}] Sending SYN packet (seq={syn_packet.seq}, ack={syn_packet.ack}, flags={format_flags(syn_packet.flags)}, adv_window={syn_packet.adv_window})")
         self.sock_fd.sendto(syn_packet.encode(), self.conn)
         
         self.window["next_seq_to_send"] += 1
+        self.window["last_byte_sent"] = self.window["next_seq_to_send"]
         
         old_state = self.state
         self.state = TCPState.SYN_SENT
@@ -129,10 +133,14 @@ class TransportSocket:
             self.state = TCPState.LAST_ACK
             print(f"[{state_to_string(old_state)} -> {state_to_string(self.state)}] Responding to peer close")
             
-        fin_packet = Packet(seq=self.window["next_seq_to_send"], ack=self.window["last_ack"], flags=FIN_FLAG)
-        print(f"[{state_to_string(self.state)}] Sending FIN packet (seq={fin_packet.seq}, ack={fin_packet.ack}, flags={format_flags(fin_packet.flags)})")
+        # Calculate advertised window
+        avail_window = MAX_NETWORK_BUFFER - self.window["recv_len"]
+        fin_packet = Packet(seq=self.window["next_seq_to_send"], ack=self.window["last_ack"], 
+                           flags=FIN_FLAG, adv_window=avail_window)
+        print(f"[{state_to_string(self.state)}] Sending FIN packet (seq={fin_packet.seq}, ack={fin_packet.ack}, flags={format_flags(fin_packet.flags)}, adv_window={avail_window})")
         self.sock_fd.sendto(fin_packet.encode(), self.conn)
         self.window["next_seq_to_send"] += 1
+        self.window["last_byte_sent"] = self.window["next_seq_to_send"]
         
         if not self.connection_closed.wait(timeout=DEFAULT_TIMEOUT):
             print(f"[{state_to_string(self.state)}] Close operation timed out")
@@ -229,6 +237,19 @@ class TransportSocket:
                         self.window["recv_len"] = 0
                     
                     print(f"[{state_to_string(self.state)}] Read {read_len} bytes from buffer, {self.window['recv_len']} bytes remaining")
+                    
+                    # After reading data, we should update our advertised window
+                    # and inform the sender that we have more space available
+                    if self.state == TCPState.ESTABLISHED and self.conn:
+                        avail_window = MAX_NETWORK_BUFFER - self.window["recv_len"]
+                        ack_packet = Packet(
+                            seq=self.window["next_seq_to_send"], 
+                            ack=self.window["last_ack"], 
+                            flags=ACK_FLAG, 
+                            adv_window=avail_window
+                        )
+                        print(f"[{state_to_string(self.state)}] Sending window update (adv_window={avail_window})")
+                        self.sock_fd.sendto(ack_packet.encode(), self.conn)
             else:
                 print(f"[ERROR] Unknown or unimplemented flag: {flags}")
                 read_len = EXIT_ERROR
@@ -243,28 +264,76 @@ class TransportSocket:
 
         # While there's data left to send
         while offset < total_len:
-            payload_len = min(MSS, total_len - offset)
-
-            seq_no = self.window["next_seq_to_send"]
-            chunk = data[offset : offset + payload_len]
-
-            segment = Packet(seq=seq_no, ack=self.window["last_ack"], flags=0, payload=chunk)
-
-            ack_goal = seq_no + payload_len
-
-            while True:
-                print(f"[{state_to_string(self.state)}] Sending data segment (seq={segment.seq}, ack={segment.ack}, flags={format_flags(segment.flags)}, len={payload_len})")
-                self.sock_fd.sendto(segment.encode(), self.conn)
-
-                if self.wait_for_ack(ack_goal):
-                    print(f"[{state_to_string(self.state)}] Segment acknowledged (seq={seq_no}, ack_goal={ack_goal})")
+            # Calculate effective window
+            with self.recv_lock:
+                effective_window = self.window["send_window"] - (self.window["last_byte_sent"] - self.window["last_byte_acked"])
+                
+                # If effective window is zero or negative, need to do window probing
+                if effective_window <= 0:
+                    current_time = time.time()
+                    # Only send a probe every 1 second
+                    if current_time - self.last_window_probe_time >= 1:
+                        self.last_window_probe_time = current_time
+                        print(f"[{state_to_string(self.state)}] Zero window condition, sending probe")
+                        self.send_window_probe()
+                    else:
+                        # Wait a bit before trying again
+                        self.wait_cond.wait(0.1)
+                    continue
+                
+                # Determine how much data we can send (limited by effective window)
+                payload_len = min(MSS, total_len - offset, effective_window)
+                
+                seq_no = self.window["next_seq_to_send"]
+                chunk = data[offset : offset + payload_len]
+                
+                # Calculate available receive window to advertise
+                avail_window = MAX_NETWORK_BUFFER - self.window["recv_len"]
+                
+                segment = Packet(
+                    seq=seq_no, 
+                    ack=self.window["last_ack"], 
+                    flags=0, 
+                    adv_window=avail_window, 
+                    payload=chunk
+                )
+                
+                ack_goal = seq_no + payload_len
+                
+                # Update last_byte_sent
+                self.window["last_byte_sent"] = seq_no + payload_len
+                
+            # Send packet outside the lock
+            print(f"[{state_to_string(self.state)}] Sending data segment (seq={segment.seq}, ack={segment.ack}, flags={format_flags(segment.flags)}, len={payload_len}, effective_window={effective_window})")
+            self.sock_fd.sendto(segment.encode(), self.conn)
+            
+            if self.wait_for_ack(ack_goal):
+                print(f"[{state_to_string(self.state)}] Segment acknowledged (seq={seq_no}, ack_goal={ack_goal})")
+                with self.recv_lock:
                     self.window["next_seq_to_send"] += payload_len
-                    break
-                else:
-                    print(f"[{state_to_string(self.state)}] Timeout: Retransmitting segment (seq={segment.seq}, ack={segment.ack})")
-
-            offset += payload_len
-
+                offset += payload_len
+            else:
+                print(f"[{state_to_string(self.state)}] Timeout: Will retransmit segment (seq={segment.seq}, ack={segment.ack})")
+    
+    def send_window_probe(self):
+        """Send a 1-byte probe to check if the receiver's window has opened"""
+        with self.recv_lock:
+            seq_no = self.window["last_byte_acked"]  # Start of unacknowledged data
+            
+            # Calculate available window to advertise
+            avail_window = MAX_NETWORK_BUFFER - self.window["recv_len"]
+            
+            # Create a 1-byte probe
+            probe = Packet(
+                seq=seq_no, 
+                ack=self.window["last_ack"], 
+                flags=0, 
+                adv_window=avail_window, 
+                payload=b"?",  # 1-byte probe
+            )
+            
+        print(f"[{state_to_string(self.state)}] Sending window probe (seq={seq_no})")
+        self.sock_fd.sendto(probe.encode(), self.conn)
 
     def wait_for_ack(self, ack_goal):
         with self.recv_lock:
@@ -277,8 +346,13 @@ class TransportSocket:
                     print(f"[{state_to_string(self.state)}] ACK timeout (current={self.window['next_seq_expected']}, goal={ack_goal})")
                     return False
 
+                # Wait for ACK to arrive
                 self.wait_cond.wait(timeout=remaining)
-
+                
+                # If we got ACK with right sequence number, update last_byte_acked
+                if self.window["next_seq_expected"] >= ack_goal:
+                    self.window["last_byte_acked"] = ack_goal
+            
             return True
 
     def backend(self):
@@ -292,16 +366,28 @@ class TransportSocket:
                     self.conn = addr
                     print(f"[{state_to_string(self.state)}] New peer connection from {addr}")
 
-                print(f"[{state_to_string(self.state)}] Received packet (seq={packet.seq}, ack={packet.ack}, flags={format_flags(packet.flags)}, payload_len={len(packet.payload)})")
+                print(f"[{state_to_string(self.state)}] Received packet (seq={packet.seq}, ack={packet.ack}, flags={format_flags(packet.flags)}, payload_len={len(packet.payload)}, adv_window={packet.adv_window})")
 
+                # Update the send window
+                with self.recv_lock:
+                    if packet.adv_window >= 0:
+                        self.window["send_window"] = packet.adv_window
+                        print(f"[{state_to_string(self.state)}] Updated send window to {packet.adv_window}")
 
                 # Handle connection establishment
                 if self.state == TCPState.LISTEN and (packet.flags & SYN_FLAG) != 0:
-                    synack_packet = Packet(seq=self.window["next_seq_to_send"], ack=packet.seq + 1, flags=SYN_FLAG | ACK_FLAG)
-                    print(f"[{state_to_string(self.state)}] Sending SYN+ACK packet (seq={synack_packet.seq}, ack={synack_packet.ack}, flags={format_flags(synack_packet.flags)})")
+                    avail_window = MAX_NETWORK_BUFFER - self.window["recv_len"]
+                    synack_packet = Packet(
+                        seq=self.window["next_seq_to_send"], 
+                        ack=packet.seq + 1, 
+                        flags=SYN_FLAG | ACK_FLAG, 
+                        adv_window=avail_window
+                    )
+                    print(f"[{state_to_string(self.state)}] Sending SYN+ACK packet (seq={synack_packet.seq}, ack={synack_packet.ack}, flags={format_flags(synack_packet.flags)}, adv_window={avail_window})")
                     self.sock_fd.sendto(synack_packet.encode(), addr)
 
                     self.window["next_seq_to_send"] += 1
+                    self.window["last_byte_sent"] = self.window["next_seq_to_send"]
                     self.window["last_ack"] = packet.seq + 1
                     
                     old_state = self.state
@@ -310,10 +396,20 @@ class TransportSocket:
 
                 elif self.state == TCPState.SYN_SENT:
                     if (packet.flags & SYN_FLAG) != 0 and (packet.flags & ACK_FLAG) != 0:
-                        self.window["next_seq_expected"] = packet.ack
+                        with self.recv_lock:
+                            self.window["next_seq_expected"] = packet.ack
+                            self.window["last_byte_acked"] = packet.ack
+                            self.window["send_window"] = packet.adv_window
+                            
+                            avail_window = MAX_NETWORK_BUFFER - self.window["recv_len"]
+                            ack_packet = Packet(
+                                seq=self.window["next_seq_to_send"], 
+                                ack=packet.seq + 1, 
+                                flags=ACK_FLAG, 
+                                adv_window=avail_window
+                            )
                         
-                        ack_packet = Packet(seq=self.window["next_seq_to_send"], ack=packet.seq + 1, flags=ACK_FLAG)
-                        print(f"[{state_to_string(self.state)}] Sending ACK packet (seq={ack_packet.seq}, ack={ack_packet.ack}, flags={format_flags(ack_packet.flags)})")
+                        print(f"[{state_to_string(self.state)}] Sending ACK packet (seq={ack_packet.seq}, ack={ack_packet.ack}, flags={format_flags(ack_packet.flags)}, adv_window={avail_window})")
                         self.sock_fd.sendto(ack_packet.encode(), addr)
                         
                         self.window["last_ack"] = packet.seq + 1
@@ -324,8 +420,14 @@ class TransportSocket:
                         self.connection_established.set()
                         
                     elif (packet.flags & SYN_FLAG) != 0:
-                        synack_packet = Packet(seq=self.window["next_seq_to_send"], ack=packet.seq + 1, flags=SYN_FLAG | ACK_FLAG)
-                        print(f"[{state_to_string(self.state)}] Simultaneous open: Sending SYN+ACK (seq={synack_packet.seq}, ack={synack_packet.ack}, flags={format_flags(synack_packet.flags)})")
+                        avail_window = MAX_NETWORK_BUFFER - self.window["recv_len"]
+                        synack_packet = Packet(
+                            seq=self.window["next_seq_to_send"], 
+                            ack=packet.seq + 1, 
+                            flags=SYN_FLAG | ACK_FLAG, 
+                            adv_window=avail_window
+                        )
+                        print(f"[{state_to_string(self.state)}] Simultaneous open: Sending SYN+ACK (seq={synack_packet.seq}, ack={synack_packet.ack}, flags={format_flags(synack_packet.flags)}, adv_window={avail_window})")
                         self.sock_fd.sendto(synack_packet.encode(), addr)
                         
                         self.window["last_ack"] = packet.seq + 1
@@ -335,9 +437,11 @@ class TransportSocket:
                         print(f"[{state_to_string(old_state)} -> {state_to_string(self.state)}] Simultaneous open")
 
                 elif self.state == TCPState.SYN_RCVD and (packet.flags & ACK_FLAG) != 0:
-                    if packet.ack > self.window["next_seq_expected"]:
-                        self.window["next_seq_expected"] = packet.ack
-                        print(f"[{state_to_string(self.state)}] Updated next_seq_expected to {packet.ack}")
+                    with self.recv_lock:
+                        if packet.ack > self.window["next_seq_expected"]:
+                            self.window["next_seq_expected"] = packet.ack
+                            self.window["last_byte_acked"] = packet.ack
+                            print(f"[{state_to_string(self.state)}] Updated next_seq_expected to {packet.ack}")
                     
                     old_state = self.state
                     self.state = TCPState.ESTABLISHED
@@ -345,8 +449,14 @@ class TransportSocket:
                     self.connection_established.set()
 
                 elif self.state == TCPState.ESTABLISHED and (packet.flags & FIN_FLAG) != 0:
-                    ack_packet = Packet(seq=self.window["next_seq_to_send"], ack=packet.seq + 1, flags=ACK_FLAG)
-                    print(f"[{state_to_string(self.state)}] Sending ACK for FIN (seq={ack_packet.seq}, ack={ack_packet.ack}, flags={format_flags(ack_packet.flags)})")
+                    avail_window = MAX_NETWORK_BUFFER - self.window["recv_len"]
+                    ack_packet = Packet(
+                        seq=self.window["next_seq_to_send"], 
+                        ack=packet.seq + 1, 
+                        flags=ACK_FLAG, 
+                        adv_window=avail_window
+                    )
+                    print(f"[{state_to_string(self.state)}] Sending ACK for FIN (seq={ack_packet.seq}, ack={ack_packet.ack}, flags={format_flags(ack_packet.flags)}, adv_window={avail_window})")
                     self.sock_fd.sendto(ack_packet.encode(), addr)
                     
                     self.window["last_ack"] = packet.seq + 1
@@ -357,8 +467,14 @@ class TransportSocket:
 
                 elif self.state == TCPState.FIN_SENT:
                     if (packet.flags & FIN_FLAG) != 0:
-                        ack_packet = Packet(seq=self.window["next_seq_to_send"], ack=packet.seq + 1, flags=ACK_FLAG)
-                        print(f"[{state_to_string(self.state)}] Sending ACK for FIN (seq={ack_packet.seq}, ack={ack_packet.ack}, flags={format_flags(ack_packet.flags)})")
+                        avail_window = MAX_NETWORK_BUFFER - self.window["recv_len"]
+                        ack_packet = Packet(
+                            seq=self.window["next_seq_to_send"], 
+                            ack=packet.seq + 1, 
+                            flags=ACK_FLAG, 
+                            adv_window=avail_window
+                        )
+                        print(f"[{state_to_string(self.state)}] Sending ACK for FIN (seq={ack_packet.seq}, ack={ack_packet.ack}, flags={format_flags(ack_packet.flags)}, adv_window={avail_window})")
                         self.sock_fd.sendto(ack_packet.encode(), addr)
                         
                         self.window["last_ack"] = packet.seq + 1
@@ -369,15 +485,19 @@ class TransportSocket:
                         print(f"[{state_to_string(old_state)} -> {state_to_string(self.state)}] Entering TIME_WAIT")
                         self.connection_closed.set()
                     elif (packet.flags & ACK_FLAG) != 0:
-                        if packet.ack > self.window["next_seq_expected"]:
-                            self.window["next_seq_expected"] = packet.ack
-                            print(f"[{state_to_string(self.state)}] Updated next_seq_expected to {packet.ack}")
+                        with self.recv_lock:
+                            if packet.ack > self.window["next_seq_expected"]:
+                                self.window["next_seq_expected"] = packet.ack
+                                self.window["last_byte_acked"] = packet.ack
+                                print(f"[{state_to_string(self.state)}] Updated next_seq_expected to {packet.ack}")
                         print(f"[{state_to_string(self.state)}] Received ACK for our FIN, waiting for peer's FIN")
 
                 elif self.state == TCPState.LAST_ACK and (packet.flags & ACK_FLAG) != 0:
-                    if packet.ack > self.window["next_seq_expected"]:
-                        self.window["next_seq_expected"] = packet.ack
-                        print(f"[{state_to_string(self.state)}] Updated next_seq_expected to {packet.ack}")
+                    with self.recv_lock:
+                        if packet.ack > self.window["next_seq_expected"]:
+                            self.window["next_seq_expected"] = packet.ack
+                            self.window["last_byte_acked"] = packet.ack
+                            print(f"[{state_to_string(self.state)}] Updated next_seq_expected to {packet.ack}")
                     
                     old_state = self.state
                     self.state = TCPState.CLOSED
@@ -388,11 +508,13 @@ class TransportSocket:
                     with self.recv_lock:
                         if packet.ack > self.window["next_seq_expected"]:
                             self.window["next_seq_expected"] = packet.ack
+                            self.window["last_byte_acked"] = packet.ack
                             print(f"[{state_to_string(self.state)}] Updated next_seq_expected to {packet.ack}")
                         self.wait_cond.notify_all()
 
                 if len(packet.payload) > 0 and self.state in [TCPState.ESTABLISHED, TCPState.CLOSE_WAIT]:
                     if packet.seq == self.window["last_ack"]:
+                        # Check if we have enough buffer space
                         if self.window["recv_len"] + len(packet.payload) <= MAX_NETWORK_BUFFER:
                             with self.recv_lock:   
                                 self.window["recv_buf"] += packet.payload
@@ -404,16 +526,40 @@ class TransportSocket:
                             print(f"[{state_to_string(self.state)}] Received data segment (seq={packet.seq}, len={len(packet.payload)}, total_received={self.window['recv_len']})")
 
                             ack_val = packet.seq + len(packet.payload)
-                            ack_packet = Packet(seq=self.window["next_seq_to_send"], ack=ack_val, flags=ACK_FLAG)
-                            print(f"[{state_to_string(self.state)}] Sending ACK for data (seq={ack_packet.seq}, ack={ack_packet.ack}, flags={format_flags(ack_packet.flags)})")
+                            # Calculate advertised window
+                            avail_window = MAX_NETWORK_BUFFER - self.window["recv_len"]
+                            ack_packet = Packet(
+                                seq=self.window["next_seq_to_send"], 
+                                ack=ack_val, 
+                                flags=ACK_FLAG, 
+                                adv_window=avail_window
+                            )
+                            print(f"[{state_to_string(self.state)}] Sending ACK for data (seq={ack_packet.seq}, ack={ack_packet.ack}, flags={format_flags(ack_packet.flags)}, adv_window={avail_window})")
                             self.sock_fd.sendto(ack_packet.encode(), addr)
                             self.window["last_ack"] = ack_val
                         else:
                             print(f"[{state_to_string(self.state)}] Buffer overflow: Cannot receive more data")
-                            ack_packet = Packet(seq=self.window["next_seq_to_send"], ack=self.window["last_ack"],flags=ACK_FLAG)
+                            # Advertise zero window
+                            ack_packet = Packet(
+                                seq=self.window["next_seq_to_send"], 
+                                ack=self.window["last_ack"], 
+                                flags=ACK_FLAG, 
+                                adv_window=0
+                            )
+                            print(f"[{state_to_string(self.state)}] Advertising zero window (seq={ack_packet.seq}, ack={ack_packet.ack}, adv_window=0)")
                             self.sock_fd.sendto(ack_packet.encode(), addr)
                     else:
                         print(f"[{state_to_string(self.state)}] Out-of-order packet (received_seq={packet.seq}, expected_seq={self.window['last_ack']})")
+                        # Send duplicate ACK
+                        avail_window = MAX_NETWORK_BUFFER - self.window["recv_len"]
+                        dup_ack = Packet(
+                            seq=self.window["next_seq_to_send"], 
+                            ack=self.window["last_ack"], 
+                            flags=ACK_FLAG, 
+                            adv_window=avail_window
+                        )
+                        print(f"[{state_to_string(self.state)}] Sending duplicate ACK (seq={dup_ack.seq}, ack={dup_ack.ack}, adv_window={avail_window})")
+                        self.sock_fd.sendto(dup_ack.encode(), addr)
                         continue
 
                 if self.state == TCPState.TIME_WAIT:
