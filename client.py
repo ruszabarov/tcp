@@ -17,7 +17,16 @@ def client_main():
         print(f"Client: Sending file '{file_name}' to the server...")
         client_socket.send(file_data)
 
-    time.sleep(10000)
+    random_data = generate_random_data(128)
+    print(f"Client: Sending randomly generated data to the server...")
+    client_socket.send(random_data)
+
+    print("Client: Waiting to receive data from the server...")
+    buf = [b""]
+    client_socket.recv(buf, 1024, flags=ReadMode.NO_FLAG)
+    print(f"Client: Received data from server:\n{buf[0].decode()}")
+
+    time.sleep(10)
 
     client_socket.close()
 
