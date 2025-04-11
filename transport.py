@@ -2,7 +2,7 @@ import socket
 import struct
 import threading
 import time  
-from grading import MSS, DEFAULT_TIMEOUT, MAX_NETWORK_BUFFER
+from grading import MSS, DEFAULT_TIMEOUT, MAX_NETWORK_BUFFER, WINDOW_INITIAL_SSTHRESH, WINDOW_INITIAL_WINDOW_SIZE
 from logs import TCPState, state_to_string, format_flags
 
 
@@ -13,6 +13,12 @@ SACK_FLAG = 0x1  # Selective Acknowledgment flag
 
 EXIT_SUCCESS = 0
 EXIT_ERROR = 1
+
+# Congestion control states
+class CongestionState:
+    SLOW_START = 0
+    CONGESTION_AVOIDANCE = 1
+    FAST_RECOVERY = 2
 
 class ReadMode:
     NO_FLAG = 0
@@ -79,6 +85,20 @@ class TransportSocket:
         self.current_timeout = DEFAULT_TIMEOUT  # Initial timeout
         self.rtt_lock = threading.Lock()  # For thread-safe access to RTT values
         self.send_times = {}          # Dictionary to store send times for packets
+
+        # Congestion control variables
+        self.cwnd = WINDOW_INITIAL_WINDOW_SIZE
+        self.ssthresh = WINDOW_INITIAL_SSTHRESH
+        self.congestion_state = CongestionState.SLOW_START
+        self.dup_ack_count = 0
+        self.last_ack_received = 0
+        
+        # Congestion state strings for logging
+        self.congestion_state_strings = {
+            CongestionState.SLOW_START: "SLOW_START",
+            CongestionState.CONGESTION_AVOIDANCE: "CONGESTION_AVOIDANCE",
+            CongestionState.FAST_RECOVERY: "FAST_RECOVERY"
+        }
 
     def socket(self, sock_type, port, server_ip=None):
         self.sock_fd = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -203,7 +223,7 @@ class TransportSocket:
             raise ConnectionError(f"Cannot send data in state {self.state}")
         
         with self.send_lock:
-            print(f"[{state_to_string(self.state)}] Sending {len(data)} bytes of data")
+            print(f"[{state_to_string(self.state)}][{self.congestion_state_strings[self.congestion_state]} cwnd={self.cwnd}] Sending {len(data)} bytes of data")
             self.send_segment(data)
 
     def recv(self, buf, length, flags):
@@ -276,15 +296,105 @@ class TransportSocket:
 
         return read_len
 
+    def handle_timeout(self):
+        """Handle congestion control on timeout (TCP Reno)"""
+        with self.rtt_lock:
+            old_cwnd = self.cwnd
+            old_ssthresh = self.ssthresh
+            
+            # Set ssthresh to half of current window, but at least 2 MSS
+            self.ssthresh = max(self.cwnd // 2, 2 * MSS)
+            # Reset cwnd to 1 MSS (TCP Tahoe behavior)
+            self.cwnd = MSS
+            # Reset duplicate ACK count
+            self.dup_ack_count = 0
+            # Enter slow start phase
+            self.congestion_state = CongestionState.SLOW_START
+            
+            print(f"[CONGESTION] Timeout: cwnd {old_cwnd} -> {self.cwnd}, ssthresh {old_ssthresh} -> {self.ssthresh}, entering {self.congestion_state_strings[self.congestion_state]}")
+
+    def handle_new_ack(self, ack_val):
+        """Handle congestion control when a new ACK is received"""
+        with self.rtt_lock:
+            if self.congestion_state == CongestionState.FAST_RECOVERY:
+                # Exit fast recovery (TCP Reno)
+                old_cwnd = self.cwnd
+                self.cwnd = self.ssthresh
+                self.dup_ack_count = 0
+                self.congestion_state = CongestionState.CONGESTION_AVOIDANCE
+                print(f"[CONGESTION] Fast recovery complete: cwnd {old_cwnd} -> {self.cwnd}, entering {self.congestion_state_strings[self.congestion_state]}")
+            elif self.congestion_state == CongestionState.SLOW_START:
+                # In slow start, increase cwnd by 1 MSS for each ACK
+                old_cwnd = self.cwnd
+                self.cwnd += MSS
+                print(f"[CONGESTION] Slow start: cwnd {old_cwnd} -> {self.cwnd}")
+                if self.cwnd >= self.ssthresh:
+                    self.congestion_state = CongestionState.CONGESTION_AVOIDANCE
+                    print(f"[CONGESTION] Slow start threshold reached: cwnd = {self.cwnd}, entering {self.congestion_state_strings[self.congestion_state]}")
+            elif self.congestion_state == CongestionState.CONGESTION_AVOIDANCE:
+                # In congestion avoidance, increase cwnd by MSS * MSS / cwnd (approximately 1 MSS per RTT)
+                old_cwnd = self.cwnd
+                self.cwnd += max(1, (MSS * MSS) // self.cwnd)
+                print(f"[CONGESTION] Congestion avoidance: cwnd {old_cwnd} -> {self.cwnd}")
+            
+            # Reset duplicate ACK count for new ACK
+            self.dup_ack_count = 0
+            self.last_ack_received = ack_val
+
+    def handle_duplicate_ack(self, ack_val):
+        """Handle congestion control when a duplicate ACK is received"""
+        with self.rtt_lock:
+            if ack_val == self.last_ack_received:
+                self.dup_ack_count += 1
+                print(f"[CONGESTION] Duplicate ACK #{self.dup_ack_count} for {ack_val}")
+                
+                if self.dup_ack_count == 3:
+                    # Fast retransmit/fast recovery (TCP Reno)
+                    old_cwnd = self.cwnd
+                    old_ssthresh = self.ssthresh
+                    
+                    # Set ssthresh to half of current window, but at least 2 MSS
+                    self.ssthresh = max(self.cwnd // 2, 2 * MSS)
+                    # Set cwnd to ssthresh + 3 MSS (TCP Reno behavior)
+                    self.cwnd = self.ssthresh + 3 * MSS
+                    # Enter fast recovery
+                    self.congestion_state = CongestionState.FAST_RECOVERY
+                    
+                    print(f"[CONGESTION] Fast retransmit: cwnd {old_cwnd} -> {self.cwnd}, ssthresh {old_ssthresh} -> {self.ssthresh}, entering {self.congestion_state_strings[self.congestion_state]}")
+                    
+                    # Indicate need for retransmission
+                    return True
+                elif self.congestion_state == CongestionState.FAST_RECOVERY:
+                    # In fast recovery, increase cwnd by 1 MSS for each additional duplicate ACK (TCP Reno)
+                    old_cwnd = self.cwnd
+                    self.cwnd += MSS
+                    print(f"[CONGESTION] Fast recovery: cwnd {old_cwnd} -> {self.cwnd}")
+            else:
+                # If it's a different ACK, reset counter
+                self.dup_ack_count = 1
+                self.last_ack_received = ack_val
+            
+            return False
+
+    def retransmit_segment(self, seq_no):
+        """Retransmit a segment starting from the given sequence number"""
+        print(f"[{state_to_string(self.state)}][{self.congestion_state_strings[self.congestion_state]} cwnd={self.cwnd}] Fast retransmit for seq={seq_no}")
+        
+        # For a proper implementation, we would need a send buffer to get the data to retransmit
+        # Since this implementation doesn't have a send buffer, we'll just mark it for retransmission
+        # The actual retransmission will occur on timeout in the send_segment method
+        pass
+
     def send_segment(self, data):
         offset = 0
         total_len = len(data)
 
         # While there's data left to send
         while offset < total_len:
-            # Calculate effective window
+            # Calculate effective window (min of cwnd and advertised window)
             with self.recv_lock:
-                effective_window = self.window["send_window"] - (self.window["last_byte_sent"] - self.window["last_byte_acked"])
+                # Use minimum of congestion window and advertised window
+                effective_window = min(self.cwnd, self.window["send_window"]) - (self.window["last_byte_sent"] - self.window["last_byte_acked"])
                 
                 # If effective window is zero or negative, need to do window probing
                 if effective_window <= 0:
@@ -292,7 +402,7 @@ class TransportSocket:
                     # Only send a probe every 1 second
                     if current_time - self.last_window_probe_time >= 1:
                         self.last_window_probe_time = current_time
-                        print(f"[{state_to_string(self.state)}] Zero window condition, sending probe")
+                        print(f"[{state_to_string(self.state)}][{self.congestion_state_strings[self.congestion_state]} cwnd={self.cwnd}] Zero window condition, sending probe")
                         self.send_window_probe()
                     else:
                         # Wait a bit before trying again
@@ -325,16 +435,18 @@ class TransportSocket:
             self.send_times[seq_no] = time.time()
                 
             # Send packet outside the lock
-            print(f"[{state_to_string(self.state)}] Sending data segment (seq={segment.seq}, ack={segment.ack}, flags={format_flags(segment.flags)}, len={payload_len}, effective_window={effective_window})")
+            print(f"[{state_to_string(self.state)}][{self.congestion_state_strings[self.congestion_state]} cwnd={self.cwnd}] Sending data segment (seq={segment.seq}, ack={segment.ack}, flags={format_flags(segment.flags)}, len={payload_len}, effective_window={effective_window})")
             self.sock_fd.sendto(segment.encode(), self.conn)
             
             if self.wait_for_ack(ack_goal):
-                print(f"[{state_to_string(self.state)}] Segment acknowledged (seq={seq_no}, ack_goal={ack_goal})")
+                print(f"[{state_to_string(self.state)}][{self.congestion_state_strings[self.congestion_state]} cwnd={self.cwnd}] Segment acknowledged (seq={seq_no}, ack_goal={ack_goal})")
                 with self.recv_lock:
                     self.window["next_seq_to_send"] += payload_len
                 offset += payload_len
             else:
-                print(f"[{state_to_string(self.state)}] Timeout: Will retransmit segment (seq={segment.seq}, ack={segment.ack})")
+                print(f"[{state_to_string(self.state)}][{self.congestion_state_strings[self.congestion_state]} cwnd={self.cwnd}] Timeout: Will retransmit segment (seq={segment.seq}, ack={segment.ack})")
+                # Handle timeout for congestion control
+                self.handle_timeout()
     
     def send_window_probe(self):
         """Send a 1-byte probe to check if the receiver's window has opened"""
@@ -356,11 +468,10 @@ class TransportSocket:
         # Record send time for RTT calculation
         self.send_times[seq_no] = time.time()
         
-        print(f"[{state_to_string(self.state)}] Sending window probe (seq={seq_no})")
+        print(f"[{state_to_string(self.state)}][{self.congestion_state_strings[self.congestion_state]} cwnd={self.cwnd}] Sending window probe (seq={seq_no})")
         self.sock_fd.sendto(probe.encode(), self.conn)
 
     def update_rtt_estimate(self, sample_rtt):
-        """Update RTT estimates using EWMA and calculate new timeout"""
         with self.rtt_lock:
             if self.estimated_rtt is None:
                 # First RTT measurement
@@ -386,12 +497,12 @@ class TransportSocket:
     def wait_for_ack(self, ack_goal):
         with self.recv_lock:
             start = time.time()
-            print(f"[{state_to_string(self.state)}] Waiting for ACK (current={self.window['next_seq_expected']}, goal={ack_goal})")
+            print(f"[{state_to_string(self.state)}][{self.congestion_state_strings[self.congestion_state]} cwnd={self.cwnd}] Waiting for ACK (current={self.window['next_seq_expected']}, goal={ack_goal})")
             while self.window["next_seq_expected"] < ack_goal:
                 elapsed = time.time() - start
                 remaining = self.current_timeout - elapsed  # Use dynamic timeout
                 if remaining <= 0:
-                    print(f"[{state_to_string(self.state)}] ACK timeout (current={self.window['next_seq_expected']}, goal={ack_goal})")
+                    print(f"[{state_to_string(self.state)}][{self.congestion_state_strings[self.congestion_state]} cwnd={self.cwnd}] ACK timeout (current={self.window['next_seq_expected']}, goal={ack_goal})")
                     return False
 
                 # Wait for ACK to arrive
@@ -414,7 +525,7 @@ class TransportSocket:
                     self.conn = addr
                     print(f"[{state_to_string(self.state)}] New peer connection from {addr}")
 
-                print(f"[{state_to_string(self.state)}] Received packet (seq={packet.seq}, ack={packet.ack}, flags={format_flags(packet.flags)}, payload_len={len(packet.payload)}, adv_window={packet.adv_window})")
+                print(f"[{state_to_string(self.state)}][{self.congestion_state_strings[self.congestion_state]} cwnd={self.cwnd}] Received packet (seq={packet.seq}, ack={packet.ack}, flags={format_flags(packet.flags)}, payload_len={len(packet.payload)}, adv_window={packet.adv_window})")
 
                 # Update the send window
                 with self.recv_lock:
@@ -585,6 +696,7 @@ class TransportSocket:
                 elif (packet.flags & ACK_FLAG) != 0 and not (packet.flags & SYN_FLAG) and not (packet.flags & FIN_FLAG):
                     with self.recv_lock:
                         if packet.ack > self.window["next_seq_expected"]:
+                            # This is a new ACK - process it for congestion control
                             old_seq_expected = self.window["next_seq_expected"]
                             self.window["next_seq_expected"] = packet.ack
                             self.window["last_byte_acked"] = packet.ack
@@ -603,6 +715,15 @@ class TransportSocket:
                             for seq in list(self.send_times.keys()):
                                 if seq < packet.ack:
                                     del self.send_times[seq]
+                            
+                            # Handle congestion control for new ACK
+                            self.handle_new_ack(packet.ack)
+                        else:
+                            # This is a duplicate ACK - process it for fast retransmit/recovery
+                            need_retransmit = self.handle_duplicate_ack(packet.ack)
+                            if need_retransmit:
+                                # Retransmit the lost segment (fast retransmit)
+                                self.retransmit_segment(packet.ack)
                         
                         self.wait_cond.notify_all()
 
